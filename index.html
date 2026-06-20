@@ -63,6 +63,8 @@
     </div>
 </div>
 
+<script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
+
 <script>
 /**
  * Hilbert curve tile ID encoding following PMTiles v3 spec.
@@ -132,6 +134,57 @@ function ZxyToID(z, x, y) {
         var latRad = 2 * Math.atan(Math.exp(y / WEBMERCATOR_R * Math.PI)) - Math.PI / 2;
         var lat = latRad * 180 / Math.PI;
         return { lng: lng, lat: lat };
+    }
+
+    // ---- 中国 GeoJSON 数据加载 ----
+    var chinaGeoJSON = null;
+    var chinaDataLoaded = false;
+    var chinaCache = {}; // 缓存结构: chinaCache[type][zoom][key] = { geometries, tileX, tileY }
+    var chinaSimplified = null; // 简化后的数据
+
+    function simplifyChinaData() {
+        if (!chinaGeoJSON || chinaSimplified) return;
+        try {
+            // 将 GeoJSON 转换为 Turf 对象并简化
+            var fc = turf.featureCollection(chinaGeoJSON.features);
+            // 简化容差：根据数据范围动态调整，约 0.01 度（约 1km）
+            var simplified = turf.simplify(fc, { tolerance: 0.01, highQuality: false, mutate: false });
+            chinaSimplified = simplified;
+            console.log('China GeoJSON simplified. Features:', simplified.features.length);
+        } catch (e) {
+            console.warn('Simplify failed, using original data:', e);
+            chinaSimplified = chinaGeoJSON;
+        }
+    }
+
+    function loadChinaData() {
+        fetch('china.json')
+            .then(function(response) {
+                if (!response.ok) {
+                    throw new Error('Failed to load china.json');
+                }
+                return response.json();
+            })
+            .then(function(data) {
+                chinaGeoJSON = data;
+                // 简化数据
+                simplifyChinaData();
+                chinaDataLoaded = true;
+                console.log('China GeoJSON loaded successfully');
+                // 初始化缓存结构
+                chinaCache['webmercator'] = {};
+                chinaCache['wgs84'] = {};
+                for (var z = MIN_ZOOM; z <= MAX_ZOOM; z++) {
+                    chinaCache['webmercator'][z] = {};
+                    chinaCache['wgs84'][z] = {};
+                }
+                // 触发重绘
+                if (viewLeft) viewLeft.draw();
+                if (viewRight) viewRight.draw();
+            })
+            .catch(function(error) {
+                console.error('Error loading China GeoJSON:', error);
+            });
     }
 
     // ---- 视图类 ----
@@ -281,41 +334,14 @@ function ZxyToID(z, x, y) {
                 ctx.strokeStyle = strokeColor;
                 ctx.strokeRect(sx0 + 0.5, sy0 + 0.5, sw - 1, sh - 1);
 
-                // 编号 + tileId（字体 24px，行高 ~28px）
-                if (sw >= 50 && sh >= 28) {
-                    var cx = sx0 + sw / 2;
-                    var cy = sy0 + sh / 2;
-                    var idInfo = null;
-                    try { idInfo = this.computeTileId(z, tx, ty); }
-                    catch (e) { idInfo = null; }
-                    var idStr = idInfo ? ('id=' + idInfo.id) : 'id=N/A';
-                    var idColor = '#ffd666';
-
-                    if (sh >= 100 && sw >= 120) {
-                        // 四行：z / x / y / id
-                        ctx.fillStyle = textColor;
-                        ctx.fillText('z=' + z, cx, cy - 42);
-                        ctx.fillText('x=' + tx, cx, cy - 14);
-                        ctx.fillText('y=' + ty, cx, cy + 14);
-                        ctx.fillStyle = idColor;
-                        ctx.fillText(idStr, cx, cy + 42);
-                    } else if (sh >= 48 && sw >= 120) {
-                        // 两行：z,x,y / id
-                        ctx.fillStyle = textColor;
-                        ctx.fillText(z + ',' + tx + ',' + ty, cx, cy - 14);
-                        ctx.fillStyle = idColor;
-                        ctx.fillText(idStr, cx, cy + 14);
-                    } else if (sw >= 90) {
-                        // 一行：仅 tileId
-                        ctx.fillStyle = idColor;
-                        ctx.fillText(idStr, cx, cy);
-                    } else {
-                        // 太窄，显示 z,x,y 单行
-                        ctx.fillStyle = textColor;
-                        ctx.fillText(z + ',' + tx + ',' + ty, cx, cy);
-                    }
-                }
+                // 绘制瓦片标签（调用独立函数）
+                this.drawTileLabel(ctx, z, tx, ty, sx0, sy0, sw, sh, textColor);
             }
+        }
+
+        // ---- 绘制中国 GeoJSON 数据 ----
+        if (chinaDataLoaded && chinaGeoJSON) {
+            this.drawChinaGeoJSON(ctx, z, startX, startY, endX, endY);
         }
 
         // 绘制中心十字
@@ -361,6 +387,168 @@ function ZxyToID(z, x, y) {
             + centerDesc;
     };
 
+    // ---- 中国 GeoJSON 数据绘制（带缓存优化）----
+
+    // 获取指定瓦片的裁剪缓存（懒加载：首次访问时计算并缓存）
+    PyramidView.prototype.getChinaTileCache = function(z, tx, ty) {
+        var typeCache = chinaCache[this.type];
+        if (!typeCache) return null;
+        var zoomCache = typeCache[z];
+        if (!zoomCache) return null;
+        var key = tx + ',' + ty;
+        if (zoomCache.hasOwnProperty(key)) {
+            return zoomCache[key]; // 可能是 null（无数据）
+        }
+
+        // 首次访问：计算并缓存
+        var result = this.computeChinaTileClip(z, tx, ty);
+        zoomCache[key] = result; // 缓存结果（可能是 null）
+        return result;
+    };
+
+    // 计算单个瓦片的中国地图裁剪数据（返回经纬度坐标的几何体数组）
+    PyramidView.prototype.computeChinaTileClip = function(z, tx, ty) {
+        var data = chinaSimplified || chinaGeoJSON;
+        if (!data || !data.features) return null;
+
+        var bbox = this.getTileBBox(z, tx, ty);
+        if (!bbox) return null;
+
+        var turfBBox = [bbox.minLng, bbox.minLat, bbox.maxLng, bbox.maxLat];
+        var clipBox = turf.bboxPolygon(turfBBox);
+        var results = [];
+
+        for (var i = 0; i < data.features.length; i++) {
+            var feature = data.features[i];
+            var geometry = feature.geometry;
+            if (!geometry) continue;
+
+            var clipped;
+            try {
+                if (geometry.type === 'Polygon') {
+                    clipped = turf.intersect(turf.polygon(geometry.coordinates), clipBox);
+                } else if (geometry.type === 'MultiPolygon') {
+                    clipped = turf.intersect(turf.multiPolygon(geometry.coordinates), clipBox);
+                }
+            } catch (e) {
+                continue;
+            }
+
+            if (!clipped || !clipped.geometry) continue;
+            // 转换为视图原生坐标系后存储（避免每帧重复转换）
+            results.push(this.convertGeomToViewNative(clipped.geometry));
+        }
+
+        return results.length > 0 ? results : null;
+    };
+
+    // 将裁剪后的几何体坐标转换为视图原生坐标系
+    // WebMercator: 经纬度 → 墨卡托坐标（米）
+    // WGS84: 保持经纬度不变
+    PyramidView.prototype.convertGeomToViewNative = function(geometry) {
+        var self = this;
+        function convertRing(coords) {
+            return coords.map(function(c) {
+                if (self.type === 'webmercator') {
+                    var m = lngLatToMercator(c[0], c[1]);
+                    return [m.x, m.y];
+                }
+                return [c[0], c[1]]; // WGS84 保持经纬度
+            });
+        }
+
+        var newCoords = [];
+        if (geometry.type === 'Polygon') {
+            for (var r = 0; r < geometry.coordinates.length; r++) {
+                newCoords.push(convertRing(geometry.coordinates[r]));
+            }
+        } else if (geometry.type === 'MultiPolygon') {
+            for (var p = 0; p < geometry.coordinates.length; p++) {
+                var rings = [];
+                for (var r = 0; r < geometry.coordinates[p].length; r++) {
+                    rings.push(convertRing(geometry.coordinates[p][r]));
+                }
+                newCoords.push(rings);
+            }
+        }
+
+        return {
+            type: geometry.type,
+            coordinates: geometry.type === 'Polygon' ? newCoords : newCoords
+        };
+    };
+
+    // 绘制已缓存的几何体（坐标已在视图原生坐标系，直接用 worldToScreen，极快）
+    PyramidView.prototype.drawClippedGeometry = function(ctx, geometry) {
+        var self = this;
+
+        function drawRing(coords) {
+            if (coords.length < 3) return;
+            ctx.beginPath();
+            for (var i = 0; i < coords.length; i++) {
+                var pt = self.worldToScreen(coords[i][0], coords[i][1]);
+                if (i === 0) ctx.moveTo(pt.x, pt.y);
+                else ctx.lineTo(pt.x, pt.y);
+            }
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+        }
+
+        if (geometry.type === 'Polygon') {
+            for (var r = 0; r < geometry.coordinates.length; r++) {
+                drawRing(geometry.coordinates[r]);
+            }
+        } else if (geometry.type === 'MultiPolygon') {
+            for (var p = 0; p < geometry.coordinates.length; p++) {
+                for (var r = 0; r < geometry.coordinates[p].length; r++) {
+                    drawRing(geometry.coordinates[p][r]);
+                }
+            }
+        }
+    };
+
+    // 绘制中国 GeoJSON（使用缓存的裁剪结果）
+    PyramidView.prototype.drawChinaGeoJSON = function(ctx, z, startX, startY, endX, endY) {
+        ctx.fillStyle = 'rgba(255, 248, 240, 0.7)';
+        ctx.strokeStyle = '#FF69B4';
+        ctx.lineWidth = 1;
+
+        for (var ty = startY; ty <= endY; ty++) {
+            for (var tx = startX; tx <= endX; tx++) {
+                var geoms = this.getChinaTileCache(z, tx, ty);
+                if (!geoms) continue;
+                for (var g = 0; g < geoms.length; g++) {
+                    this.drawClippedGeometry(ctx, geoms[g]);
+                }
+            }
+        }
+    };
+
+    // 获取瓦片的地理边界框（经纬度）
+    PyramidView.prototype.getTileBBox = function(z, tx, ty) {
+        var counts = this.getTileCounts(z);
+        var tw = this.getTileWorldSize(z);
+        var ext = this.getWorldExtent();
+
+        if (this.type === 'webmercator') {
+            var x0 = ext.minX + tx * tw.w;
+            var y0 = ext.maxY - ty * tw.h;
+            var x1 = x0 + tw.w;
+            var y1 = y0 - tw.h;
+            var ll0 = mercatorToLngLat(x0, y0);
+            var ll1 = mercatorToLngLat(x1, y1);
+            return { minLng: ll0.lng, minLat: ll1.lat, maxLng: ll1.lng, maxLat: ll0.lat };
+        } else {
+            return {
+                minLng: ext.minX + tx * tw.w,
+                minLat: ext.minY + (counts.ny - ty - 1) * tw.h,
+                maxLng: ext.minX + (tx + 1) * tw.w,
+                maxLat: ext.minY + (counts.ny - ty) * tw.h
+            };
+        }
+    };
+
     // 设置中心点（按本视图的坐标系）
     PyramidView.prototype.setCenter = function (cx, cy) {
         this.centerX = cx;
@@ -386,6 +574,48 @@ function ZxyToID(z, x, y) {
         return { id: ZxyToID(hz, x, y), hilbertZ: hz };
     };
 
+    // ---- 绘制瓦片标签（z=1  x=0  y=0 / tileId=1）----
+    PyramidView.prototype.drawTileLabel = function (ctx, z, tx, ty, sx0, sy0, sw, sh, textColor) {
+        if (sw < 200 || sh < 60) return; // 瓦片太小，不显示（24px 字体需要更多空间）
+
+        var cx = sx0 + sw / 2;
+        var cy = sy0 + sh / 2;
+
+        var idInfo = null;
+        try { idInfo = this.computeTileId(z, tx, ty); }
+        catch (e) { idInfo = null; }
+        var idStr = idInfo ? idInfo.id : 'N/A';
+
+        // 设置字体
+        ctx.font = '24px Consolas, "Courier New", monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+
+        if (z > 10) {
+            // zoom > 10：z, x, y, tileId 各自独立一行（四行显示）
+            var lineHeight = 32;
+            var totalHeight = lineHeight * 4 - 8; // 四行的总高度
+            var startY = cy - totalHeight / 2 + lineHeight / 2;
+
+            ctx.fillStyle = textColor;
+            ctx.fillText('z=' + z, cx, startY);
+            ctx.fillText('x=' + tx, cx, startY + lineHeight);
+            ctx.fillText('y=' + ty, cx, startY + lineHeight * 2);
+
+            ctx.fillStyle = '#ffd666';
+            ctx.fillText('tileId=' + idStr, cx, startY + lineHeight * 3);
+        } else {
+            // zoom <= 10：保持现状（两行显示）
+            // 第一行：z=1  x=0  y=0
+            ctx.fillStyle = textColor;
+            ctx.fillText('z=' + z + '  x=' + tx + '  y=' + ty, cx, cy - 14);
+
+            // 第二行：tileId=1（黄色）
+            ctx.fillStyle = '#ffd666';
+            ctx.fillText('tileId=' + idStr, cx, cy + 14);
+        }
+    };
+
     // ---- 联动控制 ----
     function App() {
         var leftCanvas = document.getElementById('canvas-left');
@@ -409,6 +639,9 @@ function ZxyToID(z, x, y) {
 
         this.left.draw();
         this.right.draw();
+
+        // 加载中国 GeoJSON 数据
+        loadChinaData();
     }
 
     // 把一个视图的中心点同步到另一个视图（保持地理位置一致）
